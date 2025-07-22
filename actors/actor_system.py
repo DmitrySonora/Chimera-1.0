@@ -1,0 +1,264 @@
+from typing import Dict, List, Optional, Any
+import asyncio
+import time
+from config.logging import get_logger
+from actors.base_actor import BaseActor
+from actors.messages import ActorMessage
+from utils.monitoring import measure_latency
+from config.settings import (
+    ACTOR_SYSTEM_NAME, 
+    ACTOR_SHUTDOWN_TIMEOUT,
+    ACTOR_MESSAGE_RETRY_ENABLED,
+    ACTOR_MESSAGE_MAX_RETRIES,
+    ACTOR_MESSAGE_RETRY_DELAY,
+    ACTOR_MESSAGE_RETRY_MAX_DELAY,
+    DLQ_MAX_SIZE,
+    DLQ_CLEANUP_INTERVAL,
+    DLQ_METRICS_ENABLED
+)
+
+
+class ActorSystem:
+    """Система управления акторами"""
+    
+    def __init__(self, name: str = ACTOR_SYSTEM_NAME):
+        self.name = name
+        self.logger = get_logger(f"actor_system.{name}")
+        self._actors: Dict[str, BaseActor] = {}
+        self._tasks: List[asyncio.Task] = []
+        self.is_running = False
+        self._dead_letter_queue: List[Dict[str, Any]] = []
+        self._dlq_cleanup_task: Optional[asyncio.Task] = None
+        self._dlq_total_messages = 0  # Счетчик всех сообщений в DLQ
+        self._dlq_cleaned_messages = 0  # Счетчик очищенных сообщений
+        
+    @measure_latency
+    async def register_actor(self, actor: BaseActor) -> None:
+        """Зарегистрировать актор в системе"""
+        if actor.actor_id in self._actors:
+            raise ValueError(f"Actor {actor.actor_id} already registered")
+            
+        self._actors[actor.actor_id] = actor
+        self.logger.info(f"Registered actor {actor.actor_id}")
+        
+        # Если система запущена, запускаем актор
+        if self.is_running:
+            await actor.start()
+            
+    async def unregister_actor(self, actor_id: str) -> None:
+        """Удалить актор из системы"""
+        if actor_id not in self._actors:
+            self.logger.warning(f"Actor {actor_id} not found")
+            return
+            
+        actor = self._actors[actor_id]
+        
+        # Останавливаем актор если он запущен
+        if actor.is_running:
+            await actor.stop()
+            
+        del self._actors[actor_id]
+        self.logger.info(f"Unregistered actor {actor_id}")
+        
+    async def get_actor(self, actor_id: str) -> Optional[BaseActor]:
+        """Получить актор по ID"""
+        return self._actors.get(actor_id)
+        
+    @measure_latency
+    async def send_message(self, actor_id: str, message: ActorMessage) -> None:
+        """Отправить сообщение конкретному актору с опциональным retry"""
+        actor = self._actors.get(actor_id)
+        if not actor:
+            raise ValueError(f"Actor {actor_id} not found")
+        
+        if not ACTOR_MESSAGE_RETRY_ENABLED:
+            await actor.send_message(message)
+            return
+        
+        # Retry механизм с exponential backoff
+        retry_count = 0
+        delay = ACTOR_MESSAGE_RETRY_DELAY
+        
+        while retry_count <= ACTOR_MESSAGE_MAX_RETRIES:
+            try:
+                await actor.send_message(message)
+                return  # Успешно отправлено
+            except asyncio.QueueFull as e:
+                retry_count += 1
+                if retry_count > ACTOR_MESSAGE_MAX_RETRIES:
+                    self.logger.error(
+                        f"Failed to send message to {actor_id} after "
+                        f"{ACTOR_MESSAGE_MAX_RETRIES} retries"
+                    )
+                    # Отправляем в Dead Letter Queue
+                    await self._send_to_dead_letter_queue(actor_id, message, str(e))
+                    raise
+                
+                self.logger.warning(
+                    f"Message queue full for {actor_id}, retry "
+                    f"{retry_count}/{ACTOR_MESSAGE_MAX_RETRIES} after {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+                # Exponential backoff
+                delay = min(delay * 2, ACTOR_MESSAGE_RETRY_MAX_DELAY)
+        
+    @measure_latency
+    async def broadcast_message(
+        self, 
+        message: ActorMessage, 
+        exclude: List[str] = None
+    ) -> None:
+        """Отправить сообщение всем акторам (кроме исключенных)"""
+        exclude = exclude or []
+        
+        tasks = []
+        for actor_id, actor in self._actors.items():
+            if actor_id not in exclude:
+                tasks.append(actor.send_message(message))
+                
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
+        # Собираем ID акторов, которым отправили сообщение
+        target_actors = [
+            actor_id for actor_id in self._actors.keys() 
+            if actor_id not in exclude
+        ]
+        
+        self.logger.debug(
+            f"Broadcasted message {message.message_type} to "
+            f"{len(tasks)} actors: {target_actors}"
+        )
+        
+    async def _send_to_dead_letter_queue(
+        self, 
+        actor_id: str, 
+        message: ActorMessage, 
+        error: str
+    ) -> None:
+        """Сохранить необработанное сообщение в Dead Letter Queue"""
+        dead_letter = {
+            'timestamp': asyncio.get_event_loop().time(),
+            'actor_id': actor_id,
+            'message': message,
+            'error': error
+        }
+        self._dead_letter_queue.append(dead_letter)
+        self._dlq_total_messages += 1
+        
+        self.logger.error(
+            f"Message {message.message_id} sent to DLQ. "
+            f"Actor: {actor_id}, Error: {error}"
+        )
+        
+        # Проверяем размер DLQ
+        if len(self._dead_letter_queue) > DLQ_MAX_SIZE * 0.9:
+            self.logger.warning(
+                f"DLQ is 90% full: {len(self._dead_letter_queue)}/{DLQ_MAX_SIZE}"
+            )
+    
+    def get_dead_letter_queue(self) -> List[Dict[str, Any]]:
+        """Получить содержимое Dead Letter Queue"""
+        return self._dead_letter_queue.copy()
+    
+    def clear_dead_letter_queue(self) -> int:
+        """Очистить Dead Letter Queue и вернуть количество удаленных сообщений"""
+        count = len(self._dead_letter_queue)
+        self._dead_letter_queue.clear()
+        self.logger.info(f"Cleared {count} messages from Dead Letter Queue")
+        return count
+    
+    def get_dlq_metrics(self) -> Dict[str, int]:
+        """Получить метрики Dead Letter Queue"""
+        return {
+            'current_size': len(self._dead_letter_queue),
+            'total_messages': self._dlq_total_messages,
+            'cleaned_messages': self._dlq_cleaned_messages,
+            'max_size': DLQ_MAX_SIZE
+        }
+    
+    async def _dlq_cleanup_loop(self) -> None:
+        """Периодическая очистка Dead Letter Queue"""
+        while self.is_running:
+            try:
+                await asyncio.sleep(DLQ_CLEANUP_INTERVAL)
+                
+                if len(self._dead_letter_queue) > DLQ_MAX_SIZE:
+                    # Удаляем старые сообщения
+                    messages_to_remove = len(self._dead_letter_queue) - DLQ_MAX_SIZE
+                    removed_messages = self._dead_letter_queue[:messages_to_remove]
+                    self._dead_letter_queue = self._dead_letter_queue[messages_to_remove:]
+                    
+                    self._dlq_cleaned_messages += messages_to_remove
+                    self.logger.warning(
+                        f"DLQ cleanup: removed {messages_to_remove} old messages. "
+                        f"Total cleaned: {self._dlq_cleaned_messages}"
+                    )
+                    
+                # Логируем метрики DLQ
+                if DLQ_METRICS_ENABLED:
+                    self.logger.info(
+                        f"DLQ metrics - Current size: {len(self._dead_letter_queue)}, "
+                        f"Total received: {self._dlq_total_messages}, "
+                        f"Total cleaned: {self._dlq_cleaned_messages}"
+                    )
+                    
+            except Exception as e:
+                self.logger.error(f"Error in DLQ cleanup loop: {str(e)}")
+    
+    async def start(self) -> None:
+        """Запустить систему акторов"""
+        if self.is_running:
+            self.logger.warning("Actor system already running")
+            return
+            
+        self.logger.info("Starting actor system")
+        self.is_running = True
+        
+        # Запускаем все акторы
+        for actor in self._actors.values():
+            await actor.start()
+            
+        # Запускаем задачу очистки DLQ
+        if DLQ_CLEANUP_INTERVAL > 0:
+            self._dlq_cleanup_task = asyncio.create_task(self._dlq_cleanup_loop())
+            self.logger.info("Started DLQ cleanup task")
+            
+        self.logger.info(f"Started {len(self._actors)} actors")
+        
+    async def stop(self, timeout: float = ACTOR_SHUTDOWN_TIMEOUT) -> None:
+        """Остановить систему акторов"""
+        if not self.is_running:
+            self.logger.warning("Actor system not running")
+            return
+            
+        self.logger.info("Stopping actor system")
+        self.is_running = False
+        
+        # Останавливаем задачу очистки DLQ
+        if self._dlq_cleanup_task and not self._dlq_cleanup_task.done():
+            self._dlq_cleanup_task.cancel()
+            try:
+                await self._dlq_cleanup_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Останавливаем все акторы
+        stop_tasks = []
+        for actor in self._actors.values():
+            stop_tasks.append(actor.stop())
+            
+        if stop_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*stop_tasks, return_exceptions=True),
+                    timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                self.logger.error("Timeout stopping actors, forcing shutdown")
+                # Принудительная отмена всех задач
+                for task in self._tasks:
+                    if not task.done():
+                        task.cancel()
+                        
+        self.logger.info("Actor system stopped")
